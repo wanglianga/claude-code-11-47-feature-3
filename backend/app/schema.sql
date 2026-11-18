@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS source_documents (
     doc_id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     dataset_type        TEXT NOT NULL CHECK (dataset_type IN
                         ('population','road_node','road_edge','shelter',
-                         'road_event','boundary')),
+                         'road_event','boundary','road_evidence')),
     title               TEXT NOT NULL,
     source_org          TEXT,
     unit_note           TEXT,                     -- 原文计量单位说明
@@ -173,7 +173,8 @@ CREATE TABLE IF NOT EXISTS road_network_versions (
     version_id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     cutoff_at           TIMESTAMPTZ NOT NULL,
     edge_fingerprint    TEXT NOT NULL,               -- 截止点边修订集合指纹
-    event_fingerprint   TEXT NOT NULL,               -- 截止点事件集合指纹
+    event_fingerprint   TEXT NOT NULL,               -- 人工事件+证据派生封路集合指纹
+    evidence_strategy   TEXT,                        -- 该版本采用的证据融合策略
     note                TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (cutoff_at, edge_fingerprint, event_fingerprint)
@@ -302,3 +303,238 @@ CREATE TABLE IF NOT EXISTS publications (
     created_by          TEXT NOT NULL DEFAULT 'analyst',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ============================================================================
+-- 道路通行证据融合与冲突解释（feature-3 增量）
+-- 设计要点：
+--   1. 每条候选道路事件（积水传感器/巡查照片/群众上报）保留来源坐标、观测与
+--      上传时间、方向、观测阈值、定位误差与原始证据指纹，证据只追加不覆盖。
+--   2. 证据经规则投影为（边, 方向, 有效时间区间）；投影不确定时全部候选留痕，
+--      绝不静默挑一条。空间匹配/时间推导的每一步都可在投影行中解释。
+--   3. 融合按来源可靠性 × 空间误差折减加权，绝不按来源数量多数表决；存在相反
+--      结论或证据不足时只给 unknown/conflict，不产生无来源的确定封路/通行。
+--   4. 只有 confirmed_closure 结论物化为派生封路；撤回/修正/补传沿“边+时间窗”
+--      精准失效引用任务，既有发布保留当时的证据清单。
+-- ============================================================================
+
+-- --------------------------------------------------------- 证据来源类型目录 --
+CREATE TABLE IF NOT EXISTS evidence_source_types (
+    source_type         TEXT PRIMARY KEY CHECK (source_type IN
+                        ('water_sensor','inspection_photo','crowd_report')),
+    type_name           TEXT NOT NULL,
+    base_reliability    DOUBLE PRECISION NOT NULL CHECK
+                        (base_reliability > 0 AND base_reliability <= 1),
+    official            BOOLEAN NOT NULL,
+    note                TEXT
+);
+
+-- 融合策略配置（单行）：official_only 仅采信官方传感器/巡查；multi_source 多源加权
+CREATE TABLE IF NOT EXISTS evidence_fusion_config (
+    single_row          TEXT PRIMARY KEY DEFAULT 'X' CHECK (single_row = 'X'),
+    strategy            TEXT NOT NULL CHECK (strategy IN
+                        ('official_only','multi_source')),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- --------------------------------------------- 原始证据（追加式，修订另起新行） --
+CREATE TABLE IF NOT EXISTS road_evidence (
+    evidence_id         TEXT NOT NULL,
+    revision_no         INTEGER NOT NULL DEFAULT 1,
+    source_type         TEXT NOT NULL REFERENCES evidence_source_types(source_type),
+    source_ref          TEXT NOT NULL,                  -- 设备号/照片号/上报单号
+    source_org          TEXT,
+    -- 来源坐标与定位误差（米，半径）：传感器可能偏离道路、群众上报只描述附近地名
+    geom_x              DOUBLE PRECISION NOT NULL,
+    geom_y              DOUBLE PRECISION NOT NULL,
+    location_error_m    DOUBLE PRECISION NOT NULL CHECK (location_error_m >= 0),
+    location_text       TEXT,                            -- 群众上报的附近地名词原文
+    observed_at         TIMESTAMPTZ NOT NULL,            -- 观测/拍摄时间
+    uploaded_at         TIMESTAMPTZ NOT NULL,            -- 平台收到（上传）时间
+    -- 观测方向（度，0-360，NULL=来源未给出方向）；观测阈值与原始读数/原文
+    bearing_deg         DOUBLE PRECISION CHECK
+                        (bearing_deg IS NULL OR (bearing_deg >= 0 AND bearing_deg < 360)),
+    threshold_value     DOUBLE PRECISION,                 -- 触发阈值（如积水深度 cm）
+    observed_value      DOUBLE PRECISION,                 -- 实际读数（可空，照片/上报无读数）
+    observed_recovery_at TIMESTAMPTZ,                     -- 来源给出的恢复时刻（可空）
+    offline             BOOLEAN NOT NULL DEFAULT FALSE,   -- 传感器离线：无读数不产生立场
+    threshold_unit      TEXT,
+    raw_text            TEXT,
+    evidence_fingerprint TEXT NOT NULL,                  -- 原始证据指纹（内容哈希）
+    -- 生命周期：active 参与融合；withdrawn 保留行但不参与（撤回留痕）
+    status              TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active','withdrawn')),
+    supersedes_revision INTEGER,
+    change_note         TEXT,
+    source_doc_id       BIGINT REFERENCES source_documents(doc_id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (evidence_id, revision_no),
+    CHECK (uploaded_at >= observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_observed ON road_evidence(observed_at);
+CREATE INDEX IF NOT EXISTS idx_evidence_uploaded ON road_evidence(uploaded_at);
+CREATE INDEX IF NOT EXISTS idx_evidence_status ON road_evidence(status);
+
+-- 证据修订审计：撤回、修正、补传均留痕
+CREATE TABLE IF NOT EXISTS road_evidence_audits (
+    audit_id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    evidence_id         TEXT NOT NULL,
+    revision_no         INTEGER NOT NULL,
+    action              TEXT NOT NULL CHECK (action IN
+                        ('ingest','revise','withdraw','backfill')),
+    change_json         JSONB NOT NULL,
+    changed_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_audit ON road_evidence_audits(evidence_id, revision_no);
+
+-- --------------------------------------------- 证据投影：证据 → 边/方向/时间窗 --
+-- 一条证据可投影到多条候选边（平行道路歧义时全部保留），accepted=FALSE 记录
+-- “为何不够”，供分析员从被排除路径回溯到具体证据与规则。
+CREATE TABLE IF NOT EXISTS evidence_projections (
+    projection_id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    evidence_id         TEXT NOT NULL,
+    evidence_revision   INTEGER NOT NULL,
+    edge_id             TEXT NOT NULL,
+    -- 投影方向：forward=边的 from→to，reverse=反方向，both=来源无方向（覆盖双向）
+    direction           TEXT NOT NULL CHECK (direction IN ('forward','reverse','both')),
+    stance              TEXT NOT NULL CHECK (stance IN ('closure','open','none')),
+    valid_from          TIMESTAMPTZ NOT NULL,
+    valid_to            TIMESTAMPTZ,                       -- NULL=观测未给出恢复时刻
+    -- 空间匹配留痕
+    perpendicular_m     DOUBLE PRECISION NOT NULL,         -- 来源点到边中心线垂距
+    along_m             DOUBLE PRECISION NOT NULL,         -- 垂足距边起点的沿线距离
+    edge_length_m       DOUBLE PRECISION NOT NULL,
+    spatial_weight      DOUBLE PRECISION NOT NULL,         -- 空间误差折减后的权重(0,1]
+    direction_match     TEXT NOT NULL CHECK
+                        (direction_match IN ('exact','inferred','none','unknown')),
+    direction_weight    DOUBLE PRECISION NOT NULL,
+    -- 时间推导留痕
+    time_basis          TEXT NOT NULL,                     -- observed | late_upload_discounted
+    time_weight         DOUBLE PRECISION NOT NULL,         -- 晚传折减后的权重(0,1]
+    upload_delay_sec    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    -- 投影判定
+    accepted            BOOLEAN NOT NULL,
+    reject_reason       TEXT,
+    rule_trace          JSONB NOT NULL,                    -- 完整规则轨迹（可解释）
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (evidence_id, evidence_revision, edge_id, direction),
+    CHECK (valid_to IS NULL OR valid_to > valid_from)
+);
+CREATE INDEX IF NOT EXISTS idx_proj_edge ON evidence_projections(edge_id);
+CREATE INDEX IF NOT EXISTS idx_proj_accepted ON evidence_projections(accepted);
+CREATE INDEX IF NOT EXISTS idx_proj_valid ON evidence_projections(valid_from, valid_to);
+
+-- --------------------------------------------- 融合批次（策略 + 截止点 + 指纹） --
+CREATE TABLE IF NOT EXISTS evidence_fusion_runs (
+    run_id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    strategy            TEXT NOT NULL CHECK (strategy IN
+                        ('official_only','multi_source')),
+    cutoff_at           TIMESTAMPTZ NOT NULL,
+    input_fingerprint   TEXT NOT NULL,                    -- 参与证据修订集合指纹
+    conclusion_fingerprint TEXT NOT NULL,                 -- 结论集合指纹（复现校验）
+    rule_version        TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'completed'
+                        CHECK (status IN ('completed','superseded')),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (strategy, cutoff_at, input_fingerprint)
+);
+
+-- --------------------------------------------- 融合结论：边/方向/时间窗等级 -- --
+-- level: confirmed_closure（确定封闭，可物化为封路）/ likely_closure（高倾向但不
+--   确定，只提示不定态）/ conflict（同窗相反结论）/ unknown（证据不足，保持未知）。
+-- 任何等级都带完整来源权重明细；confirmed 之外绝不生成确定性路网状态。
+CREATE TABLE IF NOT EXISTS edge_evidence_conclusions (
+    conclusion_id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    run_id              BIGINT NOT NULL REFERENCES evidence_fusion_runs(run_id),
+    strategy            TEXT NOT NULL,
+    edge_id             TEXT NOT NULL,
+    direction           TEXT NOT NULL CHECK (direction IN ('forward','reverse','both')),
+    valid_from          TIMESTAMPTZ NOT NULL,
+    valid_to            TIMESTAMPTZ,
+    level               TEXT NOT NULL CHECK (level IN
+                        ('confirmed_closure','likely_closure','conflict','unknown')),
+    -- 权重聚合（可靠性×空间/方向折减后的证据权重，非来源计数）
+    weight_closure      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    weight_open         DOUBLE PRECISION NOT NULL DEFAULT 0,
+    uncertainty         DOUBLE PRECISION NOT NULL,        -- 0..1，越大越不确定
+    has_conflict        BOOLEAN NOT NULL DEFAULT FALSE,
+    evidence_count      INTEGER NOT NULL,
+    evidence_refs       JSONB NOT NULL,                   -- 证据指纹与权重明细
+    rule_trace          JSONB NOT NULL,
+    cutoff_at           TIMESTAMPTZ NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_concl_edge_time
+    ON edge_evidence_conclusions(edge_id, valid_from, valid_to);
+CREATE INDEX IF NOT EXISTS idx_concl_run ON edge_evidence_conclusions(run_id);
+CREATE INDEX IF NOT EXISTS idx_concl_level ON edge_evidence_conclusions(level);
+
+-- 结论 ↔ 证据 多对多留痕（同时支持按证据反查它影响过哪些结论）
+CREATE TABLE IF NOT EXISTS conclusion_evidence_refs (
+    conclusion_id       BIGINT NOT NULL REFERENCES edge_evidence_conclusions(conclusion_id)
+                        ON DELETE CASCADE,
+    evidence_id         TEXT NOT NULL,
+    evidence_revision   INTEGER NOT NULL,
+    projection_id       BIGINT REFERENCES evidence_projections(projection_id),
+    stance              TEXT NOT NULL CHECK (stance IN ('closure','open')),
+    weight              DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (conclusion_id, evidence_id, evidence_revision)
+);
+CREATE INDEX IF NOT EXISTS idx_ref_evidence ON conclusion_evidence_refs(evidence_id, evidence_revision);
+
+-- --------------------------------------------- 派生封路（仅 confirmed 结论） -- --
+-- 与人工 road_events 分开存放：它完全由证据融合生成，撤回/修正时可整组重算；
+-- 快照按截止点把它与人工事件一并载入引擎。
+CREATE TABLE IF NOT EXISTS derived_road_closures (
+    derived_event_id    TEXT PRIMARY KEY,
+    conclusion_id       BIGINT NOT NULL REFERENCES edge_evidence_conclusions(conclusion_id),
+    run_id              BIGINT NOT NULL REFERENCES evidence_fusion_runs(run_id),
+    edge_id             TEXT NOT NULL,
+    direction           TEXT NOT NULL CHECK (direction IN ('forward','reverse','both')),
+    effective_from      TIMESTAMPTZ NOT NULL,
+    effective_to        TIMESTAMPTZ,
+    cutoff_at           TIMESTAMPTZ NOT NULL,
+    evidence_fingerprint TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active','retracted')),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_derived_edge ON derived_road_closures(edge_id);
+CREATE INDEX IF NOT EXISTS idx_derived_cutoff ON derived_road_closures(cutoff_at);
+
+-- --------------------------------------------- 任务 ↔ 证据结论（时间窗依赖） -- --
+-- 比 task_edge_dependencies 更细：记录任务在哪个时间窗实际经过该边，证据修订时
+-- 只重算“边相同且时间窗相交”的情景，而非该边的全部历史任务。
+CREATE TABLE IF NOT EXISTS task_evidence_dependencies (
+    task_id             UUID NOT NULL REFERENCES compute_tasks(task_id),
+    edge_id             TEXT NOT NULL,
+    traversed_from      TIMESTAMPTZ NOT NULL,
+    traversed_to        TIMESTAMPTZ NOT NULL,
+    direction           TEXT NOT NULL,
+    PRIMARY KEY (task_id, edge_id, traversed_from)
+);
+CREATE INDEX IF NOT EXISTS idx_task_ev_edge ON task_evidence_dependencies(edge_id);
+CREATE INDEX IF NOT EXISTS idx_task_ev_task ON task_evidence_dependencies(task_id);
+
+-- 任务证据清单快照：发布/计算时固化，证据后续撤回不改变既有发布的清单
+CREATE TABLE IF NOT EXISTS task_evidence_manifests (
+    task_id             UUID PRIMARY KEY REFERENCES compute_tasks(task_id),
+    run_id              BIGINT REFERENCES evidence_fusion_runs(run_id),
+    strategy            TEXT,
+    cutoff_at           TIMESTAMPTZ NOT NULL,
+    conclusion_fingerprint TEXT,
+    manifest_json       JSONB NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 证据修订影响登记：每次撤回/修正/补传记录受影响任务与网格，供审计界面追溯
+CREATE TABLE IF NOT EXISTS evidence_impact_logs (
+    impact_id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    evidence_id         TEXT NOT NULL,
+    action              TEXT NOT NULL,
+    changed_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    affected_edge_ids   JSONB NOT NULL,
+    affected_task_ids   JSONB NOT NULL,
+    affected_grid_ids   JSONB NOT NULL,
+    detail_json         JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_impact_evidence ON evidence_impact_logs(evidence_id);

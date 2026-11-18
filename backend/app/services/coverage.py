@@ -21,6 +21,7 @@ from ..engine import (
     shelter_arrival,
     solve,
 )
+from .evidence import build_task_manifest
 from .snapshot import load_population
 
 _RATIO_EPS = 1e-9
@@ -49,16 +50,20 @@ class CoverageEngine:
         label_cache: dict[str, dict[str, NodeLabel]] = {}
         share_rows: list[dict] = []
         edge_deps: set[str] = set()
+        edge_window_deps: dict[str, tuple] = {}
         node_best: dict[str, NodeLabel] = {}
 
         for grid_id, grid in sorted(self.grids.items()):
             share_rows.extend(
-                self._evaluate_grid(grid_id, grid, label_cache, edge_deps, node_best)
+                self._evaluate_grid(grid_id, grid, label_cache, edge_deps,
+                                    edge_window_deps, node_best)
             )
 
         self._persist_node_arrivals(node_best)
         self._persist_edge_dependencies(edge_deps)
+        self._persist_evidence_dependencies(edge_window_deps)
         summary = self._persist_shares_and_summary(share_rows)
+        self._persist_evidence_manifest(edge_window_deps)
         return summary
 
     # ----------------------------------------------------- 单网格评估 --
@@ -68,6 +73,7 @@ class CoverageEngine:
         grid: dict,
         label_cache: dict[str, dict[str, NodeLabel]],
         edge_deps: set[str],
+        edge_window_deps: dict[str, tuple],
         node_best: dict[str, NodeLabel],
     ) -> list[dict]:
         base = {
@@ -122,6 +128,10 @@ class CoverageEngine:
                 label_cache[node_id] = labels
                 for lab in labels.values():
                     edge_deps.update(lab.edge_path)
+                    for win in lab.edge_windows:
+                        prev = edge_window_deps.get(win.edge_id)
+                        if prev is None or win.t_entry < prev[0] or win.t_exit > prev[1]:
+                            edge_window_deps[win.edge_id] = (win.t_entry, win.t_exit)
                     best = node_best.get(lab.node_id)
                     if best is None or lab.arrival_time < best.arrival_time:
                         node_best[lab.node_id] = lab
@@ -243,6 +253,29 @@ class CoverageEngine:
                 "ON CONFLICT DO NOTHING",
                 [(self.task["task_id"], e) for e in sorted(edge_deps)],
             )
+
+    def _persist_evidence_dependencies(self, edge_windows: dict[str, tuple]) -> None:
+        """逐边实际通行时间窗：证据修订只失效边相同且时间窗相交的任务。"""
+        if not edge_windows:
+            return
+        with self.conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO task_evidence_dependencies
+                       (task_id, edge_id, traversed_from, traversed_to, direction)
+                   VALUES (%s,%s,%s,%s,'forward')
+                   ON CONFLICT (task_id, edge_id, traversed_from) DO NOTHING""",
+                [(self.task["task_id"], eid, w[0], w[1])
+                 for eid, w in sorted(edge_windows.items())],
+            )
+
+    def _persist_evidence_manifest(self, edge_windows: dict[str, tuple]) -> None:
+        """固化当时证据清单；后续撤回/修正不改写本任务与既有发布。"""
+        dep_windows = [
+            {"edge_id": eid, "traversed_from": w[0], "traversed_to": w[1]}
+            for eid, w in sorted(edge_windows.items())
+        ]
+        build_task_manifest(self.conn, self.task["task_id"],
+                            self.evidence_cutoff, dep_windows)
 
     def _persist_shares_and_summary(self, share_rows: list[dict]) -> dict[str, Any]:
         with self.conn.cursor() as cur:

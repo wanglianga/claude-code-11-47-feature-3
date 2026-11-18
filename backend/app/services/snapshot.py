@@ -7,6 +7,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from ..engine.models import Edge, GraphSnapshot, Node, OpenWindow, RoadEvent, Shelter
+from .evidence import load_active_derived_closures
 
 
 def _fingerprint(rows: list[dict]) -> str:
@@ -14,14 +15,38 @@ def _fingerprint(rows: list[dict]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _derived_event_rows(conn, cutoff_at: datetime, strategy: str) -> list[dict]:
+    """截止点可见的证据派生封路，展开为引擎事件行（含方向解析）。"""
+    closures = load_active_derived_closures(conn, cutoff_at, strategy)
+    return [
+        {
+            "event_id": d["derived_event_id"],
+            "event_type": "closure",
+            "edge_id": d["edge_id"],
+            "effective_from": d["effective_from"],
+            "effective_to": d["effective_to"],
+            "speed_limit_kmh": None,
+            "revision_no": 1,
+            "direction": d["direction"],
+            "origin": "derived",
+        }
+        for d in closures
+    ]
+
+
 def get_or_create_network_version(conn, cutoff_at: datetime) -> dict:
     """返回截止点对应的路网版本行；不存在则物化为新版本。
 
     纳入条件体现“证据截止时间”：
       - 边修订：valid_from <= cutoff < valid_to；
-      - 事件：平台 received_at <= cutoff 且当前状态 active（已撤销的封路不再阻断，
-        但其修订过程保留在 road_event_revisions 审计表中）。
+      - 人工事件：平台 received_at <= cutoff 且当前状态 active（已撤销的封路不再阻断，
+        但其修订过程保留在 road_event_revisions 审计表中）；
+      - 证据派生封路：当前融合策略下 cutoff 可见的活动派生封路一并进入事件指纹，
+        因此证据撤回/修正/补传后同截止点也会产生新版本，旧版本结果仍可精确复现。
     """
+    from .evidence import get_active_strategy
+
+    strategy = get_active_strategy(conn)
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -45,9 +70,12 @@ def get_or_create_network_version(conn, cutoff_at: datetime) -> dict:
             (cutoff_at,),
         )
         event_rows = cur.fetchall()
+        derived_rows = _derived_event_rows(conn, cutoff_at, strategy)
 
         edge_fp = _fingerprint(edge_rows)
-        event_fp = _fingerprint(event_rows)
+        event_fp = _fingerprint(
+            [dict(r, origin="manual", direction="both") for r in event_rows] + derived_rows
+        )
 
         cur.execute(
             "SELECT * FROM road_network_versions WHERE cutoff_at = %s "
@@ -62,13 +90,14 @@ def get_or_create_network_version(conn, cutoff_at: datetime) -> dict:
         if matching is not None:
             return matching
 
-        # 同一截止点出现迟到修订：物化为新版本（version_id 变化 → 情景签名变化，
-        # 旧版本结果保留且只能通过旧签名访问，不可能覆盖新版本索引）。
+        # 同一截止点出现迟到修订/证据变化：物化为新版本（version_id 变化 → 情景签名
+        # 变化，旧版本结果保留且只能通过旧签名访问，不可能覆盖新版本索引）。
         cur.execute(
             """INSERT INTO road_network_versions
-                   (cutoff_at, edge_fingerprint, event_fingerprint, note)
-               VALUES (%s, %s, %s, %s) RETURNING *""",
-            (cutoff_at, edge_fp, event_fp, f"截止点 {cutoff_at.isoformat()} 自动物化"),
+                   (cutoff_at, edge_fingerprint, event_fingerprint, evidence_strategy, note)
+               VALUES (%s, %s, %s, %s, %s) RETURNING *""",
+            (cutoff_at, edge_fp, event_fp, strategy,
+             f"截止点 {cutoff_at.isoformat()} 自动物化（证据策略 {strategy}）"),
         )
         new_row = cur.fetchone()
         if rows:
@@ -86,6 +115,8 @@ def get_or_create_network_version(conn, cutoff_at: datetime) -> dict:
 
 
 def load_snapshot(conn, version_id: int) -> GraphSnapshot:
+    from .evidence import get_active_strategy
+
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM road_network_versions WHERE version_id=%s", (version_id,))
         version = cur.fetchone()
@@ -112,6 +143,8 @@ def load_snapshot(conn, version_id: int) -> GraphSnapshot:
             (cutoff,),
         )
         event_rows = cur.fetchall()
+        strategy = get_active_strategy(conn)
+        derived_rows = _derived_event_rows(conn, cutoff, strategy)
         cur.execute("SELECT * FROM shelters WHERE active = TRUE ORDER BY shelter_id")
         shelter_rows = cur.fetchall()
         cur.execute("SELECT * FROM shelter_open_windows ORDER BY shelter_id, open_from")
@@ -128,6 +161,21 @@ def load_snapshot(conn, version_id: int) -> GraphSnapshot:
         for n in node_rows
     }
 
+    # 反向结论解析：若存在端点互换的对向有向边，封路挂到对向边；否则保留为
+    # direction=reverse 事件（引擎跳过，等于“对向无此有向边可阻断”，仍可审计）。
+    pair_lookup = {(r["from_node"], r["to_node"]): r["edge_id"] for r in edge_rows}
+    edge_endpoints = {r["edge_id"]: (r["from_node"], r["to_node"]) for r in edge_rows}
+    derived_event_rows = []
+    for d in derived_rows:
+        target_edge = d["edge_id"]
+        direction = d["direction"]
+        if direction == "reverse" and d["edge_id"] in edge_endpoints:
+            a, b = edge_endpoints[d["edge_id"]]
+            target_edge = pair_lookup.get((b, a), d["edge_id"])
+            if target_edge != d["edge_id"]:
+                direction = "forward"  # 已落到对向有向边，按其正向阻断
+        derived_event_rows.append({**d, "edge_id": target_edge, "direction": direction})
+
     events_by_edge: dict[str, list[RoadEvent]] = {}
     for e in event_rows:
         events_by_edge.setdefault(e["edge_id"], []).append(
@@ -139,6 +187,20 @@ def load_snapshot(conn, version_id: int) -> GraphSnapshot:
                 effective_to=e["effective_to"],
                 speed_limit_kmh=e["speed_limit_kmh"],
                 revision_no=e["revision_no"],
+            )
+        )
+    for d in derived_event_rows:
+        events_by_edge.setdefault(d["edge_id"], []).append(
+            RoadEvent(
+                event_id=d["event_id"],
+                event_type=d["event_type"],
+                edge_id=d["edge_id"],
+                effective_from=d["effective_from"],
+                effective_to=d["effective_to"],
+                speed_limit_kmh=None,
+                revision_no=1,
+                direction=d["direction"],
+                origin="derived",
             )
         )
 

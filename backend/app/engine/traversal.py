@@ -19,7 +19,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Optional
 
-from .models import Edge, GraphSnapshot, NodeLabel, Shelter, WaitSegment
+from .models import Edge, EdgeWindow, GraphSnapshot, NodeLabel, Shelter, WaitSegment
 
 _EPS = timedelta(seconds=1)
 
@@ -62,6 +62,9 @@ def _blocked_by_closure(edge: Edge, t_entry: datetime, t_exit: datetime) -> bool
     for ev in edge.events:
         if ev.event_type != "closure":
             continue
+        # 反向车道结论不阻断当前有向边（“反向车道仍可通行”口径）
+        if getattr(ev, "direction", "both") == "reverse":
+            continue
         if _intersects(t_entry, t_exit, ev.effective_from, ev.effective_to):
             return True
     return False
@@ -79,6 +82,8 @@ def earliest_feasible_entry(
     for ev in edge.events:
         if ev.event_type != "closure":
             continue
+        if getattr(ev, "direction", "both") == "reverse":
+            continue  # 反向车道封路不约束本方向
         if ev.effective_to is None:
             continue  # 尚未恢复：不会产生候选
         if ev.effective_to > t_entry:
@@ -155,6 +160,9 @@ def solve(
                 node_path=current.node_path + (v,),
                 edge_path=current.edge_path + (edge.edge_id,),
                 waits=waits,
+                edge_windows=current.edge_windows + (
+                    EdgeWindow(edge_id=edge.edge_id, t_entry=t_enter, t_exit=t_exit),
+                ),
             )
             heapq.heappush(queue, (t_exit, v))
 

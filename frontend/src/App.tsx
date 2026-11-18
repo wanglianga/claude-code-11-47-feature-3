@@ -4,6 +4,7 @@ import ComparisonView from "./ComparisonView";
 import SourcesView from "./SourcesView";
 import CacheView from "./CacheView";
 import PublicationsView from "./PublicationsView";
+import EvidenceView from "./EvidenceView";
 
 export type Toast = { kind: "info" | "error"; text: string; key: number };
 
@@ -12,6 +13,10 @@ let toastSeq = 0;
 export default function App() {
   const [tab, setTab] = useState("scenario");
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [evidencePrefill, setEvidencePrefill] = useState<{
+    task_id: string;
+    grid_id: string;
+  } | null>(null);
 
   const pushToast = useCallback((text: string, kind: "info" | "error" = "info") => {
     const key = ++toastSeq;
@@ -21,9 +26,15 @@ export default function App() {
     }, 6000);
   }, []);
 
+  const openEvidenceDrilldown = useCallback((task_id: string, grid_id: string) => {
+    setEvidencePrefill({ task_id, grid_id });
+    setTab("evidence");
+  }, []);
+
   const tabs = [
     ["scenario", "情景分析"],
     ["comparison", "情景对比"],
+    ["evidence", "证据融合"],
     ["sources", "来源目录"],
     ["cache", "缓存与任务"],
     ["publications", "发布记录"],
@@ -47,8 +58,11 @@ export default function App() {
         ))}
       </nav>
       <main>
-        {tab === "scenario" && <ScenarioView pushToast={pushToast} />}
+        {tab === "scenario" && <ScenarioView pushToast={pushToast} onOpenEvidence={openEvidenceDrilldown} />}
         {tab === "comparison" && <ComparisonView pushToast={pushToast} />}
+        {tab === "evidence" && (
+          <EvidenceView pushToast={pushToast} initialPrefill={evidencePrefill} />
+        )}
         {tab === "sources" && <SourcesView />}
         {tab === "cache" && <CacheView pushToast={pushToast} />}
         {tab === "publications" && <PublicationsView pushToast={pushToast} />}

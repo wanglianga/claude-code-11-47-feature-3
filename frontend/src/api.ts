@@ -186,4 +186,94 @@ export const api = {
   reseed: () => request("/admin/reseed", { method: "POST" }),
 
   applyC2: () => request("/admin/apply-c2-revision", { method: "POST" }),
+
+  // --------------------------------------------------------- 证据融合 --
+  listEvidence: (sourceType?: string, status?: string) =>
+    request<{ evidence: import("./types").EvidenceRow[] }>(
+      `/evidence?${new URLSearchParams({
+        ...(sourceType ? { source_type: sourceType } : {}),
+        ...(status ? { status } : {}),
+      })}`
+    ),
+
+  evidenceDetail: (evidenceId: string) =>
+    request<{
+      evidence_id: string;
+      revisions: import("./types").EvidenceRow[];
+      projections: import("./types").ProjectionRow[];
+      audits: Array<Record<string, unknown>>;
+    }>(`/evidence/${encodeURIComponent(evidenceId)}`),
+
+  ingestEvidence: (payload: Record<string, unknown>) =>
+    request<Record<string, unknown>>("/evidence", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  reviseEvidence: (evidenceId: string, payload: Record<string, unknown>, action: "revise" | "backfill") =>
+    request<Record<string, unknown>>(
+      `/evidence/${encodeURIComponent(evidenceId)}/${action}`,
+      { method: "POST", body: JSON.stringify(payload) }
+    ),
+
+  withdrawEvidence: (evidenceId: string, changeNote?: string) =>
+    request<Record<string, unknown>>(
+      `/evidence/${encodeURIComponent(evidenceId)}/withdraw${
+        changeNote ? `?change_note=${encodeURIComponent(changeNote)}` : ""
+      }`,
+      { method: "POST" }
+    ),
+
+  listProjections: (accepted?: boolean, edgeId?: string) =>
+    request<{ projections: import("./types").ProjectionRow[] }>(
+      `/evidence/projections/list?${new URLSearchParams({
+        ...(accepted === undefined ? {} : { accepted: String(accepted) }),
+        ...(edgeId ? { edge_id: edgeId } : {}),
+      })}`
+    ),
+
+  listConclusions: (params?: Record<string, string>) =>
+    request<{ conclusions: import("./types").ConclusionRow[] }>(
+      `/evidence/conclusions/list?${new URLSearchParams(params ?? {})}`
+    ),
+
+  listFusionRuns: () =>
+    request<{ runs: import("./types").FusionRunRow[] }>("/evidence/runs/list"),
+
+  listDerivedClosures: () =>
+    request<{ derived_closures: import("./types").DerivedClosureRow[] }>(
+      "/evidence/derived-closures/list"
+    ),
+
+  listImpactLogs: (evidenceId?: string) =>
+    request<{ impact_logs: import("./types").ImpactLogRow[] }>(
+      `/evidence/impact-logs/list${
+        evidenceId ? `?evidence_id=${encodeURIComponent(evidenceId)}` : ""
+      }`
+    ),
+
+  getStrategy: () =>
+    request<{ active_strategy: "official_only" | "multi_source" }>(
+      "/evidence/strategy"
+    ),
+
+  setStrategy: (strategy: string) =>
+    request<Record<string, unknown>>("/evidence/strategy", {
+      method: "POST",
+      body: JSON.stringify({ strategy }),
+    }),
+
+  runFusion: (cutoffAt: string, strategy?: string) =>
+    request<import("./types").FusionRunResult>("/evidence/fusion/run", {
+      method: "POST",
+      body: JSON.stringify({ cutoff_at: cutoffAt, ...(strategy ? { strategy } : {}) }),
+    }),
+
+  taskManifest: (taskId: string) =>
+    request<Record<string, unknown>>(`/evidence/tasks/${taskId}/manifest`),
+
+  gridDrilldown: (taskId: string, gridId: string) =>
+    request<import("./types").EvidenceDrilldown>(
+      `/evidence/tasks/${taskId}/grids/${encodeURIComponent(gridId)}/drilldown`
+    ),
 };

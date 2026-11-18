@@ -63,3 +63,35 @@ class EventCreate(BaseModel):
     speed_limit_kmh: Optional[float] = None
     source_title: str = "临时上报事件"
     raw_text: str = ""
+
+
+class EvidenceIngest(BaseModel):
+    """道路通行证据接入：保留来源坐标、观测/上传时间、方向、阈值、定位误差。"""
+
+    evidence_id: str
+    source_type: str  # water_sensor | inspection_photo | crowd_report
+    source_ref: str
+    source_org: Optional[str] = None
+    geom_x: float
+    geom_y: float
+    location_error_m: float = Field(ge=0)
+    location_text: Optional[str] = None
+    observed_at: datetime
+    uploaded_at: datetime
+    bearing_deg: Optional[float] = Field(default=None, ge=0, lt=360)
+    threshold_value: Optional[float] = None
+    observed_value: Optional[float] = None
+    observed_recovery_at: Optional[datetime] = None
+    offline: bool = False
+    threshold_unit: Optional[str] = "cm"
+    raw_text: str = ""
+    change_note: Optional[str] = None
+
+
+class FusionRunRequest(BaseModel):
+    strategy: Optional[str] = None  # 缺省取当前活动策略
+    cutoff_at: datetime
+
+
+class FusionStrategyRequest(BaseModel):
+    strategy: str  # official_only | multi_source

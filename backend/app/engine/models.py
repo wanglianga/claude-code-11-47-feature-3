@@ -21,7 +21,12 @@ class Node:
 
 @dataclass(frozen=True)
 class RoadEvent:
-    """封路或分时限速。effective_to 为 None 表示尚未恢复/长期有效。"""
+    """封路或分时限速。effective_to 为 None 表示尚未恢复/长期有效。
+
+    direction 仅对封路有意义：forward 只阻断该有向边的通行方向，reverse 记录
+    反向车道结论（引擎沿有向边行进时不受其阻断），both 表示来源未给方向。
+    origin 区分人工登记事件与证据融合派生事件，便于审计回溯。
+    """
 
     event_id: str
     event_type: str  # closure | speed_limit
@@ -30,6 +35,8 @@ class RoadEvent:
     effective_to: Optional[datetime]
     speed_limit_kmh: Optional[float]
     revision_no: int
+    direction: str = "both"  # forward | reverse | both
+    origin: str = "manual"  # manual | derived
 
 
 @dataclass(frozen=True)
@@ -83,6 +90,15 @@ class WaitSegment:
 
 
 @dataclass(frozen=True)
+class EdgeWindow:
+    """一条有向边的实际通行时间窗 [t_entry, t_exit)，供证据时间窗相交判定。"""
+
+    edge_id: str
+    t_entry: datetime
+    t_exit: datetime
+
+
+@dataclass(frozen=True)
 class NodeLabel:
     node_id: str
     arrival_time: datetime
@@ -90,3 +106,4 @@ class NodeLabel:
     node_path: tuple[str, ...]
     edge_path: tuple[str, ...]
     waits: tuple[WaitSegment, ...]
+    edge_windows: tuple[EdgeWindow, ...] = field(default_factory=tuple)

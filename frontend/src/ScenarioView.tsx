@@ -17,8 +17,10 @@ const C2 = "2026-07-15T08:45:00+00:00";
 
 export default function ScenarioView({
   pushToast,
+  onOpenEvidence,
 }: {
   pushToast: (t: string, k?: "info" | "error") => void;
+  onOpenEvidence?: (taskId: string, gridId: string) => void;
 }) {
   const [form, setForm] = useState({
     name: "临时情景",
@@ -177,6 +179,7 @@ export default function ScenarioView({
                 <option value="">全部边界</option>
                 <option value="B_MAIN">B_MAIN 主城区</option>
                 <option value="B_EXT">B_EXT 扩展区</option>
+                <option value="B_WEST">B_WEST 城西积水片（证据融合）</option>
               </select>
             </label>
           </div>
@@ -188,6 +191,8 @@ export default function ScenarioView({
             >
               <option value={C1}>C1 07:30（首发管制）</option>
               <option value={C2}>C2 08:45（E7 重开 + E2 新封路，需先在缓存页应用修订）</option>
+              <option value="2026-07-15T08:45:00+00:00">C_EV 08:45（证据融合第一截止点）</option>
+              <option value="2026-07-15T11:30:00+00:00">C3 11:30（晚传照片与修订可见后）</option>
             </select>
           </label>
           <label className="field">
@@ -284,6 +289,16 @@ export default function ScenarioView({
               任务依赖边（封路修订沿此定位）：
               <div>{witness.deps.map((e) => <span key={e} className="path-chip">{e}</span>)}</div>
             </div>
+            {result && onOpenEvidence && (
+              <div style={{ marginTop: 8 }}>
+                <button
+                  className="btn secondary"
+                  onClick={() => onOpenEvidence(result.task_id, selectedGrid)}
+                >
+                  在“证据融合”页下钻该网格的证据与冲突
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

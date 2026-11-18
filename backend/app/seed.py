@@ -58,10 +58,15 @@ def reseed(conn) -> None:
             TRUNCATE TABLE
                 grid_share_results, node_arrivals, coverage_summaries,
                 coverage_cache_index, compute_task_viewers, task_edge_dependencies,
+                task_evidence_dependencies, task_evidence_manifests,
                 compute_tasks, publications, scenarios, grid_connectors,
                 pop_grid_revisions, pop_grids, shelter_open_windows, shelters,
                 road_event_revisions, road_events, road_event_registry,
                 road_edge_revisions, road_nodes,
+                conclusion_evidence_refs, derived_road_closures,
+                edge_evidence_conclusions, evidence_fusion_runs, evidence_impact_logs,
+                evidence_projections, road_evidence_audits, road_evidence,
+                evidence_fusion_config, evidence_source_types,
                 region_boundaries, road_network_versions, source_documents
             RESTART IDENTITY CASCADE
             """
@@ -70,6 +75,9 @@ def reseed(conn) -> None:
     _seed_documents_and_network(conn)
     _seed_shelters(conn)
     _seed_population(conn)
+    from .seed_evidence import seed_evidence
+
+    seed_evidence(conn)
     conn.commit()
 
 
@@ -441,4 +449,4 @@ if __name__ == "__main__":
     with get_conn() as connection:
         reseed(connection)
         seed_large(connection)
-    print("seed completed: small hand-computable network + large 8x8 sample")
+    print("seed completed: small hand-computable network + large 8x8 sample + west evidence sample")

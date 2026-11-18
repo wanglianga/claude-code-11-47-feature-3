@@ -1,5 +1,6 @@
 from .models import (
     Edge,
+    EdgeWindow,
     GraphSnapshot,
     Node,
     NodeLabel,
@@ -18,6 +19,7 @@ from .traversal import (
 
 __all__ = [
     "Edge",
+    "EdgeWindow",
     "GraphSnapshot",
     "Node",
     "NodeLabel",

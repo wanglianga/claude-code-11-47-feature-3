@@ -54,7 +54,7 @@ def _scenario_context(conn, task_id: str) -> dict[str, Any]:
             SELECT t.task_id, t.evidence_cutoff_at, t.graph_version_id, t.kind, t.stale,
                    s.scenario_id, s.name, s.population_as_of, s.departure_time,
                    s.max_trip_minutes, s.road_cutoff, s.signature, s.boundary_id,
-                   v.edge_fingerprint, v.event_fingerprint
+                   v.edge_fingerprint, v.event_fingerprint, v.evidence_strategy
             FROM compute_tasks t
             JOIN scenarios s ON s.scenario_id = t.scenario_id
             JOIN road_network_versions v ON v.version_id = t.graph_version_id
@@ -63,6 +63,12 @@ def _scenario_context(conn, task_id: str) -> dict[str, Any]:
             (task_id,),
         )
         ctx = cur.fetchone()
+        cur.execute(
+            "SELECT manifest_json, conclusion_fingerprint, run_id, strategy "
+            "FROM task_evidence_manifests WHERE task_id=%s",
+            (task_id,),
+        )
+        ctx["evidence_manifest"] = cur.fetchone()
         cur.execute("SELECT grid_id, boundary_id, population FROM pop_grids "
                     "JOIN LATERAL (SELECT population FROM pop_grid_revisions r "
                     "WHERE r.grid_id=pop_grids.grid_id AND r.as_of_date <= %s "
@@ -284,6 +290,15 @@ def _full_manifest(ctx: dict) -> dict:
         "graph_version_id": ctx["graph_version_id"],
         "edge_fingerprint": ctx["edge_fingerprint"],
         "event_fingerprint": ctx["event_fingerprint"],
+        "evidence_strategy": ctx.get("evidence_strategy"),
+        # 发布时固化的证据清单：后续证据撤回/修正不改写既有发布
+        "evidence_manifest": ctx["evidence_manifest"]["manifest_json"]
+        if ctx.get("evidence_manifest") else None,
+        "evidence_run_id": ctx["evidence_manifest"]["run_id"]
+        if ctx.get("evidence_manifest") else None,
+        "evidence_conclusion_fingerprint":
+            ctx["evidence_manifest"]["conclusion_fingerprint"]
+            if ctx.get("evidence_manifest") else None,
         "grid_populations": {gid: g["population"] for gid, g in ctx["grids"].items()},
         "grid_boundaries": {gid: g["boundary_id"] for gid, g in ctx["grids"].items()},
     }

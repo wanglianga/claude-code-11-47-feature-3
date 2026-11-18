@@ -242,3 +242,143 @@ export interface Comparison {
   warnings: string[];
   basis_checks: Record<string, boolean>;
 }
+
+// ------------------------------------------------------------- 证据融合 --
+export type EvidenceSourceType = "water_sensor" | "inspection_photo" | "crowd_report";
+export type EvidenceLevel =
+  | "confirmed_closure"
+  | "likely_closure"
+  | "conflict"
+  | "unknown";
+
+export interface EvidenceRow {
+  evidence_id: string;
+  revision_no: number;
+  source_type: EvidenceSourceType;
+  source_ref: string;
+  source_org: string | null;
+  geom_x: number;
+  geom_y: number;
+  location_error_m: number;
+  location_text: string | null;
+  observed_at: string;
+  uploaded_at: string;
+  bearing_deg: number | null;
+  threshold_value: number | null;
+  observed_value: number | null;
+  observed_recovery_at: string | null;
+  offline: boolean;
+  raw_text: string | null;
+  evidence_fingerprint: string;
+  status: "active" | "withdrawn";
+  change_note: string | null;
+}
+
+export interface ProjectionRow {
+  projection_id: number;
+  evidence_id: string;
+  evidence_revision: number;
+  edge_id: string;
+  direction: "forward" | "reverse" | "both";
+  stance: "closure" | "open" | "none";
+  valid_from: string;
+  valid_to: string | null;
+  perpendicular_m: number;
+  along_m: number;
+  spatial_weight: number;
+  direction_match: string;
+  direction_weight: number;
+  time_basis: string;
+  time_weight: number;
+  upload_delay_sec: number;
+  accepted: boolean;
+  reject_reason: string | null;
+  rule_trace: Record<string, unknown>;
+  source_type?: EvidenceSourceType;
+  source_ref?: string;
+}
+
+export interface ConclusionRow {
+  conclusion_id: number;
+  run_id: number;
+  strategy: "official_only" | "multi_source";
+  edge_id: string;
+  direction: string;
+  valid_from: string;
+  valid_to: string | null;
+  level: EvidenceLevel;
+  weight_closure: number;
+  weight_open: number;
+  uncertainty: number;
+  has_conflict: boolean;
+  evidence_count: number;
+  evidence_refs: Array<Record<string, unknown>>;
+  rule_trace: Record<string, unknown>;
+  cutoff_at: string;
+}
+
+export interface FusionRunRow {
+  run_id: number;
+  strategy: string;
+  cutoff_at: string;
+  input_fingerprint: string;
+  conclusion_fingerprint: string;
+  rule_version: string;
+  status: string;
+  conclusion_count: number;
+  created_at: string;
+}
+
+export interface FusionRunResult {
+  run_id: number;
+  strategy: string;
+  cutoff_at: string;
+  input_fingerprint: string;
+  conclusion_fingerprint: string;
+  conclusion_count: number;
+  level_breakdown: Record<EvidenceLevel, number>;
+  derived_closures: string[];
+  invalidation: {
+    changed_edges?: string[];
+    affected_task_ids?: string[];
+    affected_grid_ids?: string[];
+    staled_total: number;
+  };
+  rule_version: string;
+}
+
+export interface ImpactLogRow {
+  impact_id: number;
+  evidence_id: string;
+  action: string;
+  changed_at: string;
+  affected_edge_ids: string[];
+  affected_task_ids: string[];
+  affected_grid_ids: string[];
+  detail_json: Record<string, unknown>;
+}
+
+export interface DerivedClosureRow {
+  derived_event_id: string;
+  conclusion_id: number;
+  run_id: number;
+  edge_id: string;
+  direction: string;
+  effective_from: string;
+  effective_to: string | null;
+  cutoff_at: string;
+  status: "active" | "retracted";
+}
+
+export interface EvidenceDrilldown {
+  grid_id: string;
+  found: boolean;
+  cutoff_at: string;
+  witness_edges: string[];
+  incident_edges: string[];
+  share_reasons: string[];
+  conclusions: ConclusionRow[];
+  projections: ProjectionRow[];
+  manifest_snapshot: Record<string, unknown> | null;
+  impact_logs: ImpactLogRow[];
+}
